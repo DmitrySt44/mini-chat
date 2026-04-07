@@ -2,12 +2,24 @@ import {
   collection,
   doc,
   getDoc,
+  getDocs,
   onSnapshot,
   query,
   setDoc,
   where,
 } from "firebase/firestore";
 import { db } from "./firebase";
+
+export async function getUserChats(uid) {
+  const chatsRef = collection(db, "chats");
+  const q = query(chatsRef, where("members", "array-contains", uid));
+  const snapshot = await getDocs(q);
+
+  return snapshot.docs.map((item) => ({
+    id: item.id,
+    ...item.data(),
+  }));
+}
 
 export function subscribeToUserChats(uid, callback, errorCallback) {
   const chatsRef = collection(db, "chats");

@@ -1,5 +1,6 @@
 const ONESIGNAL_APP_ID = "0ee2af92-ab64-451e-9e70-1bdce50487fe";
-const ONESIGNAL_API_KEY = "os_v2_app_b3rk7evlmrcr5htqdpookbeh73etis5hr23unaffiwt723gan2jhultaxf6hnfeacplehbez4wpq5lftouk257e2wixt6m2yc5ozfsa";
+const ONESIGNAL_API_KEY =
+  "os_v2_app_b3rk7evlmrcr5htqdpookbeh72ehobcfelte3t5gh72twlmde64g3cy3ibdb3v3bd42mqchtkvvqzeutc5syw5yctn22e2firt2pkmq";
 
 export async function sendPushNotification({
   chatId,
@@ -14,7 +15,7 @@ export async function sendPushNotification({
   }
 
   try {
-    const response = await fetch("https://api.onesignal.com/notifications?c=push", {
+    const response = await fetch("https://api.onesignal.com/notifications", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -46,7 +47,11 @@ export async function sendPushNotification({
     const result = await response.json().catch(() => null);
 
     if (!response.ok) {
-      console.error("OneSignal push error:", result || response.statusText);
+      console.error("OneSignal push error:", {
+        status: response.status,
+        statusText: response.statusText,
+        result,
+      });
       return;
     }
 

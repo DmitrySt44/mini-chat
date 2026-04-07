@@ -22,9 +22,7 @@ import "./styles.css";
 function formatTime(timestamp) {
   if (!timestamp) return "";
 
-  const date = new Date(timestamp);
-
-  return date.toLocaleTimeString([], {
+  return new Date(timestamp).toLocaleTimeString([], {
     hour: "2-digit",
     minute: "2-digit",
   });
@@ -32,6 +30,24 @@ function formatTime(timestamp) {
 
 function buildTempId() {
   return `temp_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function getChatPreviewText(chat, currentUserId) {
+  const text = chat.lastMessageText?.trim();
+
+  if (!text) {
+    return "Сообщений пока нет";
+  }
+
+  if (chat.lastMessageSenderId === currentUserId) {
+    return `Вы: ${text}`;
+  }
+
+  if (chat.lastMessageSenderName) {
+    return `${chat.lastMessageSenderName}: ${text}`;
+  }
+
+  return text;
 }
 
 function LoginScreen({
@@ -46,13 +62,13 @@ function LoginScreen({
     <div className="login-page">
       <div className="login-card">
         <h1>Mini Chat</h1>
-        <p className="login-subtitle">Вход для участников</p>
+        <p className="login-subtitle">Войдите, чтобы продолжить</p>
 
         <input
           className="text-input"
           placeholder="Email"
           value={email}
-          onChange={(e) => setEmail(e.target.value)}
+          onChange={(event) => setEmail(event.target.value)}
         />
 
         <input
@@ -60,7 +76,7 @@ function LoginScreen({
           placeholder="Пароль"
           type="password"
           value={password}
-          onChange={(e) => setPassword(e.target.value)}
+          onChange={(event) => setPassword(event.target.value)}
         />
 
         <button
@@ -80,27 +96,21 @@ function App() {
 
   const [user, setUser] = useState(null);
   const [profile, setProfile] = useState(null);
-
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [isLoggingIn, setIsLoggingIn] = useState(false);
-
   const [chats, setChats] = useState([]);
-  const [chatReads, setChatReads] = useState({});
   const [activeChat, setActiveChat] = useState(null);
-
+  const [chatReads, setChatReads] = useState({});
   const [serverMessages, setServerMessages] = useState([]);
   const [pendingMessages, setPendingMessages] = useState([]);
   const [isMessagesLoading, setIsMessagesLoading] = useState(false);
-
   const [text, setText] = useState("");
   const [isSending, setIsSending] = useState(false);
-
   const [loadingChats, setLoadingChats] = useState(false);
   const [isMobileView, setIsMobileView] = useState(
     window.matchMedia(mobileQuery).matches
   );
-
   const [pushState, setPushState] = useState({
     permission: "default",
     optedIn: false,
@@ -108,31 +118,66 @@ function App() {
     externalId: null,
   });
   const [isPushBusy, setIsPushBusy] = useState(false);
-
   const [isSidebarMenuOpen, setIsSidebarMenuOpen] = useState(false);
 
   const bottomRef = useRef(null);
   const activeChatIdRef = useRef(null);
+  const lastIncomingMessageIdRef = useRef(null);
+  const profileCacheRef = useRef(new Map());
+  const hasChatHistoryEntryRef = useRef(false);
+  const sidebarMenuRef = useRef(null);
 
   const currentUserName = useMemo(() => {
     return profile?.name || user?.email || "Пользователь";
   }, [profile, user]);
 
+  async function resolveSenderName(senderId) {
+    if (!senderId || senderId === user?.uid) {
+      return currentUserName;
+    }
+
+    if (profileCacheRef.current.has(senderId)) {
+      return profileCacheRef.current.get(senderId);
+    }
+
+    const senderProfile = await getUserProfile(senderId);
+    const senderName =
+      senderProfile?.name || senderProfile?.email || "Пользователь";
+
+    profileCacheRef.current.set(senderId, senderName);
+    return senderName;
+  }
+
   const visibleMessages = useMemo(() => {
     const confirmedClientIds = new Set(
-      serverMessages.map((msg) => msg.clientMessageId).filter(Boolean)
+      serverMessages.map((message) => message.clientMessageId).filter(Boolean)
     );
 
     const filteredPending = pendingMessages.filter(
-      (msg) =>
-        msg.chatId === activeChat?.id &&
-        !confirmedClientIds.has(msg.clientMessageId)
+      (message) =>
+        message.chatId === activeChat?.id &&
+        !confirmedClientIds.has(message.clientMessageId)
     );
 
     return [...serverMessages, ...filteredPending].sort(
-      (a, b) => (a.createdAtMs || 0) - (b.createdAtMs || 0)
+      (left, right) => (left.createdAtMs || 0) - (right.createdAtMs || 0)
     );
-  }, [serverMessages, pendingMessages, activeChat]);
+  }, [activeChat, pendingMessages, serverMessages]);
+
+  const chatsWithMeta = useMemo(() => {
+    return chats.map((chat) => {
+      const lastReadAt = Number(chatReads[chat.id] || 0);
+      const lastMessageAt = Number(chat.lastMessageAt || 0);
+      const isUnread =
+        lastMessageAt > lastReadAt && chat.lastMessageSenderId !== user?.uid;
+
+      return {
+        ...chat,
+        isUnread,
+        previewText: getChatPreviewText(chat, user?.uid),
+      };
+    });
+  }, [chatReads, chats, user?.uid]);
 
   useEffect(() => {
     const media = window.matchMedia(mobileQuery);
@@ -165,7 +210,7 @@ function App() {
         const state = await getPushState();
         setPushState(state);
       } catch (error) {
-        console.error("Ошибка инициализации OneSignal:", error);
+        console.error("OneSignal init error:", error);
       }
     }
 
@@ -173,140 +218,197 @@ function App() {
   }, []);
 
   useEffect(() => {
-    let unsubscribeChats = null;
-    let unsubscribeReads = null;
-
-    const unsubscribeAuth = observeAuth(async (u) => {
-      setUser(u);
-      setProfile(null);
+    const unsubscribe = observeAuth(async (nextUser) => {
+      setUser(nextUser);
+      setActiveChat(null);
       setChats([]);
       setChatReads({});
-      setActiveChat(null);
       setServerMessages([]);
       setPendingMessages([]);
       setText("");
+      setLoadingChats(false);
       setIsSidebarMenuOpen(false);
+      activeChatIdRef.current = null;
+      lastIncomingMessageIdRef.current = null;
+      profileCacheRef.current = new Map();
+      hasChatHistoryEntryRef.current = false;
 
-      if (unsubscribeChats) {
-        unsubscribeChats();
-        unsubscribeChats = null;
-      }
+      if (!nextUser) {
+        setProfile(null);
 
-      if (unsubscribeReads) {
-        unsubscribeReads();
-        unsubscribeReads = null;
-      }
-
-      if (!u) {
         try {
           await logoutOneSignal();
           const state = await getPushState();
           setPushState(state);
         } catch (error) {
-          console.error("Ошибка logout OneSignal:", error);
+          console.error("OneSignal logout error:", error);
         }
 
         return;
       }
 
       try {
-        await loginOneSignal(u.uid);
+        await loginOneSignal(nextUser.uid);
         const state = await getPushState();
         setPushState(state);
       } catch (error) {
-        console.error("Ошибка login OneSignal:", error);
+        console.error("OneSignal login error:", error);
       }
 
       try {
-        const currentUserProfile = await getUserProfile(u.uid);
+        const currentUserProfile = await getUserProfile(nextUser.uid);
         setProfile(currentUserProfile);
+        profileCacheRef.current.set(
+          nextUser.uid,
+          currentUserProfile?.name ||
+            currentUserProfile?.email ||
+            nextUser.email ||
+            "Пользователь"
+        );
       } catch (error) {
-        console.error("Ошибка загрузки профиля:", error);
+        console.error("Profile loading error:", error);
       }
-
-      setLoadingChats(true);
-
-      unsubscribeChats = subscribeToUserChats(
-        u.uid,
-        async (rawChats) => {
-          try {
-            const preparedChats = await Promise.all(
-              rawChats.map(async (chat) => {
-                const displayTitle = await getChatDisplayTitle(chat, u.uid);
-
-                return {
-                  ...chat,
-                  displayTitle,
-                };
-              })
-            );
-
-            preparedChats.sort((a, b) => {
-              const aTime = Number(a.lastMessageAt || 0);
-              const bTime = Number(b.lastMessageAt || 0);
-
-              if (bTime !== aTime) {
-                return bTime - aTime;
-              }
-
-              if (a.type === "group" && b.type !== "group") return 1;
-              if (a.type !== "group" && b.type === "group") return -1;
-
-              return a.displayTitle.localeCompare(b.displayTitle, "ru");
-            });
-
-            setChats(preparedChats);
-
-            setActiveChat((prev) => {
-              if (!prev) {
-                if (!window.matchMedia(mobileQuery).matches && preparedChats.length > 0) {
-                  return preparedChats[0];
-                }
-                return prev;
-              }
-
-              const stillExists = preparedChats.find((chat) => chat.id === prev.id);
-              return stillExists || null;
-            });
-          } catch (error) {
-            console.error("Ошибка подготовки чатов:", error);
-          } finally {
-            setLoadingChats(false);
-          }
-        },
-        (error) => {
-          console.error("Ошибка подписки на чаты:", error);
-          setLoadingChats(false);
-        }
-      );
-
-      unsubscribeReads = subscribeToChatReads(
-        u.uid,
-        (readsMap) => {
-          setChatReads(readsMap);
-        },
-        (error) => {
-          console.error("Ошибка подписки на chatReads:", error);
-        }
-      );
     });
 
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    const handlePopState = () => {
+      if (window.matchMedia(mobileQuery).matches && activeChatIdRef.current) {
+        hasChatHistoryEntryRef.current = false;
+        activeChatIdRef.current = null;
+        setActiveChat(null);
+      }
+    };
+
+    window.addEventListener("popstate", handlePopState);
+
     return () => {
-      unsubscribeAuth();
-
-      if (unsubscribeChats) {
-        unsubscribeChats();
-      }
-
-      if (unsubscribeReads) {
-        unsubscribeReads();
-      }
+      window.removeEventListener("popstate", handlePopState);
     };
   }, []);
 
   useEffect(() => {
+    if (!isMobileView) {
+      hasChatHistoryEntryRef.current = false;
+      return;
+    }
+
+    if (activeChat?.id && !hasChatHistoryEntryRef.current) {
+      window.history.pushState({ chatId: activeChat.id }, "");
+      hasChatHistoryEntryRef.current = true;
+      return;
+    }
+
+    if (!activeChat?.id) {
+      hasChatHistoryEntryRef.current = false;
+    }
+  }, [activeChat?.id, isMobileView]);
+
+  useEffect(() => {
+    if (!isSidebarMenuOpen) {
+      return;
+    }
+
+    const handlePointerDown = (event) => {
+      if (!sidebarMenuRef.current?.contains(event.target)) {
+        setIsSidebarMenuOpen(false);
+      }
+    };
+
+    window.addEventListener("pointerdown", handlePointerDown);
+
+    return () => {
+      window.removeEventListener("pointerdown", handlePointerDown);
+    };
+  }, [isSidebarMenuOpen]);
+
+  useEffect(() => {
+    if (!user?.uid) {
+      return;
+    }
+
+    const unsubscribe = subscribeToChatReads(
+      user.uid,
+      (nextChatReads) => {
+        setChatReads(nextChatReads);
+      },
+      (error) => {
+        console.error("Chat read state error:", error);
+      }
+    );
+
+    return () => unsubscribe();
+  }, [user?.uid]);
+
+  useEffect(() => {
+    if (!user?.uid) {
+      return;
+    }
+
+    setLoadingChats(true);
+
+    const unsubscribe = subscribeToUserChats(
+      user.uid,
+      async (rawChats) => {
+        const preparedChats = await Promise.all(
+          rawChats.map(async (chat) => {
+            const displayTitle = await getChatDisplayTitle(chat, user.uid);
+            const lastMessageSenderName = await resolveSenderName(
+              chat.lastMessageSenderId
+            );
+
+            return {
+              ...chat,
+              displayTitle,
+              lastMessageSenderName,
+            };
+          })
+        );
+
+        preparedChats.sort((left, right) => {
+          const leftLastMessageAt = Number(left.lastMessageAt || 0);
+          const rightLastMessageAt = Number(right.lastMessageAt || 0);
+
+          if (leftLastMessageAt !== rightLastMessageAt) {
+            return rightLastMessageAt - leftLastMessageAt;
+          }
+
+          if (left.type === "group" && right.type !== "group") return 1;
+          if (left.type !== "group" && right.type === "group") return -1;
+          return left.displayTitle.localeCompare(right.displayTitle, "ru");
+        });
+
+        setChats(preparedChats);
+        setActiveChat((currentActiveChat) => {
+          if (!currentActiveChat) {
+            if (!window.matchMedia(mobileQuery).matches) {
+              return preparedChats[0] || null;
+            }
+
+            return currentActiveChat;
+          }
+
+          return (
+            preparedChats.find((chat) => chat.id === currentActiveChat.id) || null
+          );
+        });
+        setLoadingChats(false);
+      },
+      (error) => {
+        console.error("Chat loading error:", error);
+        setLoadingChats(false);
+      }
+    );
+
+    return () => unsubscribe();
+  }, [currentUserName, mobileQuery, user?.uid]);
+
+  useEffect(() => {
     const chatId = activeChat?.id || null;
     activeChatIdRef.current = chatId;
+    lastIncomingMessageIdRef.current = null;
 
     setServerMessages([]);
     setText("");
@@ -325,92 +427,97 @@ function App() {
           return;
         }
 
+        const previousMessageId = lastIncomingMessageIdRef.current;
+        const newestMessage =
+          nextMessages.length > 0 ? nextMessages[nextMessages.length - 1] : null;
+
+        if (newestMessage) {
+          lastIncomingMessageIdRef.current = newestMessage.id;
+        }
+
         setServerMessages(nextMessages);
 
         const confirmedClientIds = new Set(
-          nextMessages.map((msg) => msg.clientMessageId).filter(Boolean)
+          nextMessages.map((message) => message.clientMessageId).filter(Boolean)
         );
 
-        setPendingMessages((prev) =>
-          prev.filter((msg) => !confirmedClientIds.has(msg.clientMessageId))
+        setPendingMessages((previous) =>
+          previous.filter(
+            (message) => !confirmedClientIds.has(message.clientMessageId)
+          )
         );
 
         setIsMessagesLoading(false);
+
+        if (
+          previousMessageId &&
+          newestMessage &&
+          newestMessage.id !== previousMessageId &&
+          newestMessage.senderId !== user?.uid &&
+          document.visibilityState !== "visible" &&
+          "Notification" in window &&
+          Notification.permission === "granted"
+        ) {
+          const title =
+            activeChat?.displayTitle || newestMessage.senderName || "Mini Chat";
+          const options = {
+            body: newestMessage.text,
+            tag: `chat-${chatId}`,
+            data: { chatId },
+          };
+
+          if ("serviceWorker" in navigator) {
+            navigator.serviceWorker.ready
+              .then((registration) => registration.showNotification(title, options))
+              .catch((error) => {
+                console.error("Service worker notification error:", error);
+                new Notification(title, options);
+              });
+          } else {
+            new Notification(title, options);
+          }
+        }
       },
       (error) => {
         if (activeChatIdRef.current !== chatId) {
           return;
         }
 
-        console.error("Ошибка загрузки сообщений:", error);
+        console.error("Message loading error:", error);
         setIsMessagesLoading(false);
       }
     );
 
     return () => unsubscribe();
-  }, [activeChat?.id]);
+  }, [activeChat?.displayTitle, activeChat?.id, user?.uid]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [visibleMessages, activeChat?.id]);
 
   useEffect(() => {
-    if (!isMobileView) {
+    const lastVisibleMessage =
+      visibleMessages.length > 0 ? visibleMessages[visibleMessages.length - 1] : null;
+
+    if (!activeChat?.id || !user?.uid || !lastVisibleMessage) {
       return;
     }
 
-    const handlePopState = () => {
-      setIsSidebarMenuOpen(false);
-
-      if (activeChatIdRef.current) {
-        setActiveChat(null);
-      }
-    };
-
-    window.addEventListener("popstate", handlePopState);
-
-    return () => {
-      window.removeEventListener("popstate", handlePopState);
-    };
-  }, [isMobileView]);
-
-  useEffect(() => {
-    if (!isMobileView || !activeChat) {
+    if (lastVisibleMessage.senderId === user.uid) {
       return;
     }
 
-    const currentState = window.history.state || {};
+    const lastReadAt = Number(chatReads[activeChat.id] || 0);
+    const lastMessageAt = Number(lastVisibleMessage.createdAtMs || 0);
 
-    if (!currentState.chatOpen) {
-      window.history.pushState({ chatOpen: true }, "");
-    }
-  }, [activeChat, isMobileView]);
-
-  useEffect(() => {
-    async function syncReadState() {
-      if (!user || !activeChat) return;
-
-      const lastVisibleMessage = visibleMessages[visibleMessages.length - 1];
-      const latestVisibleAt = Number(lastVisibleMessage?.createdAtMs || 0);
-      const latestChatAt = Number(activeChat?.lastMessageAt || 0);
-      const latestAt = Math.max(latestVisibleAt, latestChatAt);
-      const currentReadAt = Number(chatReads[activeChat.id] || 0);
-
-      if (latestAt > currentReadAt) {
-        try {
-          await markChatAsRead(activeChat.id, user.uid, latestAt);
-          setChatReads((prev) => ({
-            ...prev,
-            [activeChat.id]: latestAt,
-          }));
-        } catch (error) {
-          console.error("Ошибка markChatAsRead:", error);
-        }
-      }
+    if (lastMessageAt <= lastReadAt) {
+      return;
     }
 
-    syncReadState();
-  }, [activeChat?.id, activeChat?.lastMessageAt, visibleMessages, user, chatReads]);
+    markChatAsRead(activeChat.id, user.uid, lastMessageAt).catch((error) => {
+      console.error("Mark as read error:", error);
+    });
+  }, [activeChat?.id, chatReads, user?.uid, visibleMessages]);
 
   async function handleLogin() {
     try {
@@ -419,7 +526,7 @@ function App() {
       setEmail("");
       setPassword("");
     } catch (error) {
-      console.error("Ошибка входа:", error);
+      console.error("Login error:", error);
       alert("Не удалось войти");
     } finally {
       setIsLoggingIn(false);
@@ -428,26 +535,33 @@ function App() {
 
   async function handleLogout() {
     try {
+      setIsSidebarMenuOpen(false);
       await logout();
       await logoutOneSignal();
       const state = await getPushState();
       setPushState(state);
-      setIsSidebarMenuOpen(false);
     } catch (error) {
-      console.error("Ошибка выхода:", error);
+      console.error("Logout error:", error);
     }
   }
 
   async function handleEnablePush() {
     try {
+      setIsSidebarMenuOpen(false);
       setIsPushBusy(true);
-      const state = await requestPushPermission();
+      await requestPushPermission();
+
+      if (user?.uid) {
+        await loginOneSignal(user.uid);
+      }
+
+      const state = await getPushState();
       setPushState(state);
       alert(
         `Push status:\npermission=${state.permission}\noptedIn=${state.optedIn}\nexternalId=${state.externalId || "null"}`
       );
     } catch (error) {
-      console.error("Ошибка включения push:", error);
+      console.error("Push enable error:", error);
       alert("Не удалось включить уведомления");
     } finally {
       setIsPushBusy(false);
@@ -456,26 +570,25 @@ function App() {
 
   async function handleRefreshPushState() {
     try {
+      setIsSidebarMenuOpen(false);
       const state = await getPushState();
       setPushState(state);
       alert(
         `Push status:\npermission=${state.permission}\noptedIn=${state.optedIn}\nexternalId=${state.externalId || "null"}`
       );
     } catch (error) {
-      console.error("Ошибка проверки push:", error);
+      console.error("Push state check error:", error);
     }
   }
 
   async function handleSendMessage() {
     const trimmed = text.trim();
 
-    if (!activeChat) return;
-    if (!trimmed) return;
-    if (isSending) return;
+    if (!activeChat || !trimmed || isSending) {
+      return;
+    }
 
     const clientMessageId = buildTempId();
-    const now = Date.now();
-
     const optimisticMessage = {
       id: clientMessageId,
       clientMessageId,
@@ -483,12 +596,12 @@ function App() {
       senderId: user.uid,
       senderName: currentUserName,
       text: trimmed,
-      createdAtMs: now,
+      createdAtMs: Date.now(),
       pending: true,
       failed: false,
     };
 
-    setPendingMessages((prev) => [...prev, optimisticMessage]);
+    setPendingMessages((previous) => [...previous, optimisticMessage]);
     setText("");
     setIsSending(true);
 
@@ -501,51 +614,34 @@ function App() {
         clientMessageId,
       });
 
-      setPendingMessages((prev) =>
-        prev.map((msg) =>
-          msg.clientMessageId === clientMessageId
-            ? { ...msg, pending: false, failed: false }
-            : msg
+      setPendingMessages((previous) =>
+        previous.map((message) =>
+          message.clientMessageId === clientMessageId
+            ? { ...message, pending: false, failed: false }
+            : message
         )
       );
 
-      if (activeChat) {
-        setChats((prev) =>
-          prev.map((chat) =>
-            chat.id === activeChat.id
-              ? {
-                  ...chat,
-                  lastMessageAt: now,
-                  lastMessageSenderId: user.uid,
-                  lastMessageText: trimmed,
-                }
-              : chat
-          )
-        );
-      }
-
       const recipientIds = (activeChat.members || []).filter(
-        (id) => id !== user.uid
+        (memberId) => memberId !== user.uid
       );
 
-      if (recipientIds.length > 0) {
-        await sendPushNotification({
-          chatId: activeChat.id,
-          chatTitle: activeChat.displayTitle || "Чат",
-          messageText: trimmed,
-          senderId: user.uid,
-          senderName: currentUserName,
-          recipientIds,
-        });
-      }
+      await sendPushNotification({
+        chatId: activeChat.id,
+        chatTitle: activeChat.displayTitle || "Чат",
+        messageText: trimmed,
+        senderId: user.uid,
+        senderName: currentUserName,
+        recipientIds,
+      });
     } catch (error) {
-      console.error("Ошибка отправки сообщения:", error);
+      console.error("Send message error:", error);
 
-      setPendingMessages((prev) =>
-        prev.map((msg) =>
-          msg.clientMessageId === clientMessageId
-            ? { ...msg, failed: true, pending: false }
-            : msg
+      setPendingMessages((previous) =>
+        previous.map((message) =>
+          message.clientMessageId === clientMessageId
+            ? { ...message, failed: true, pending: false }
+            : message
         )
       );
 
@@ -563,30 +659,18 @@ function App() {
   }
 
   function openChat(chat) {
-    setIsSidebarMenuOpen(false);
+    activeChatIdRef.current = chat.id;
     setActiveChat(chat);
   }
 
   function backToChatList() {
-    if (isMobileView) {
-      if (window.history.state?.chatOpen) {
-        window.history.back();
-        return;
-      }
-
-      setActiveChat(null);
+    if (isMobileView && hasChatHistoryEntryRef.current) {
+      window.history.back();
       return;
     }
 
+    activeChatIdRef.current = null;
     setActiveChat(null);
-  }
-
-  function getChatUnread(chat) {
-    const lastMessageAt = Number(chat.lastMessageAt || 0);
-    const lastReadAt = Number(chatReads[chat.id] || 0);
-    const isOwnLastMessage = chat.lastMessageSenderId === user?.uid;
-
-    return lastMessageAt > lastReadAt && !isOwnLastMessage;
   }
 
   if (!user) {
@@ -607,7 +691,7 @@ function App() {
 
   return (
     <div className="app-layout">
-      {showSidebar && (
+      {showSidebar ? (
         <aside className="sidebar">
           <div className="sidebar-header">
             <div className="sidebar-header-text">
@@ -618,13 +702,14 @@ function App() {
               </div>
             </div>
 
-            <div className="sidebar-menu-wrap">
+            <div className="sidebar-menu-wrap" ref={sidebarMenuRef}>
               <button
                 className="icon-button"
-                onClick={() => setIsSidebarMenuOpen((prev) => !prev)}
-                aria-label="Меню"
+                onClick={() => setIsSidebarMenuOpen((previous) => !previous)}
+                aria-label="Открыть меню"
+                aria-expanded={isSidebarMenuOpen}
               >
-                ⋮
+                ...
               </button>
 
               {isSidebarMenuOpen ? (
@@ -658,55 +743,47 @@ function App() {
           <div className="chat-list">
             {loadingChats ? (
               <div className="empty-state">Загрузка чатов...</div>
-            ) : chats.length === 0 ? (
+            ) : chatsWithMeta.length === 0 ? (
               <div className="empty-state">Чаты не найдены</div>
             ) : (
-              chats.map((chat) => {
-                const hasUnread = getChatUnread(chat);
+              chatsWithMeta.map((chat) => (
+                <button
+                  key={chat.id}
+                  className={`chat-item ${
+                    activeChat?.id === chat.id ? "chat-item-active" : ""
+                  }`}
+                  onClick={() => openChat(chat)}
+                >
+                  <div className="chat-item-top">
+                    <div className="chat-item-title">{chat.displayTitle}</div>
+                    {chat.isUnread ? <span className="unread-dot" /> : null}
+                  </div>
 
-                return (
-                  <button
-                    key={chat.id}
-                    className={`chat-item ${
-                      activeChat?.id === chat.id ? "chat-item-active" : ""
-                    }`}
-                    onClick={() => openChat(chat)}
-                  >
-                    <div className="chat-item-top">
-                      <div className="chat-item-title">{chat.displayTitle}</div>
-                      {hasUnread ? <span className="unread-dot" /> : null}
-                    </div>
+                  <div className="chat-item-subtitle">
+                    {chat.type === "group" ? "Общий чат" : "Личный чат"}
+                  </div>
 
-                    <div className="chat-item-subtitle">
-                      {chat.type === "group" ? "Групповой чат" : "Личный чат"}
-                    </div>
-
-                    <div className="chat-item-preview">
-                      {chat.lastMessageText || "Сообщений пока нет"}
-                    </div>
-                  </button>
-                );
-              })
+                  <div className="chat-item-preview">{chat.previewText}</div>
+                </button>
+              ))
             )}
           </div>
         </aside>
-      )}
+      ) : null}
 
-      {showChatPanel && (
+      {showChatPanel ? (
         <main className="chat-panel">
           {activeChat ? (
             <>
               <div className="chat-header">
-                {isMobileView && (
+                {isMobileView ? (
                   <button className="back-button" onClick={backToChatList}>
                     ←
                   </button>
-                )}
+                ) : null}
 
                 <div className="chat-header-info">
-                  <div className="chat-header-title">
-                    {activeChat.displayTitle}
-                  </div>
+                  <div className="chat-header-title">{activeChat.displayTitle}</div>
                   <div className="chat-header-subtitle">
                     {activeChat.type === "group"
                       ? "Общий чат"
@@ -721,12 +798,12 @@ function App() {
                 ) : visibleMessages.length === 0 ? (
                   <div className="empty-state">Сообщений пока нет</div>
                 ) : (
-                  visibleMessages.map((msg) => {
-                    const isMine = msg.senderId === user.uid;
+                  visibleMessages.map((message) => {
+                    const isMine = message.senderId === user.uid;
 
                     return (
                       <div
-                        key={msg.id}
+                        key={message.id}
                         className={`message-row ${
                           isMine ? "message-row-mine" : "message-row-other"
                         }`}
@@ -736,16 +813,14 @@ function App() {
                             isMine
                               ? "message-bubble-mine"
                               : "message-bubble-other"
-                          } ${msg.failed ? "message-bubble-failed" : ""}`}
+                          } ${message.failed ? "message-bubble-failed" : ""}`}
                         >
-                          <div className="message-author">{msg.senderName}</div>
-
-                          <div className="message-text">{msg.text}</div>
-
+                          <div className="message-author">{message.senderName}</div>
+                          <div className="message-text">{message.text}</div>
                           <div className="message-time">
-                            {formatTime(msg.createdAtMs)}
-                            {msg.pending ? " • отправка..." : ""}
-                            {msg.failed ? " • ошибка" : ""}
+                            {formatTime(message.createdAtMs)}
+                            {message.pending ? " • отправка..." : ""}
+                            {message.failed ? " • ошибка" : ""}
                           </div>
                         </div>
                       </div>
@@ -761,7 +836,7 @@ function App() {
                   className="text-input message-input textarea-input"
                   placeholder="Введите сообщение"
                   value={text}
-                  onChange={(e) => setText(e.target.value)}
+                  onChange={(event) => setText(event.target.value)}
                   onKeyDown={handleInputKeyDown}
                   rows={2}
                 />
@@ -776,10 +851,10 @@ function App() {
               </div>
             </>
           ) : (
-            <div className="empty-chat-screen">Выбери чат слева</div>
+            <div className="empty-chat-screen">Выберите чат слева</div>
           )}
         </main>
-      )}
+      ) : null}
     </div>
   );
 }
