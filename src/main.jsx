@@ -1,8 +1,22 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import ReactDOM from "react-dom/client";
 import { login, logout, observeAuth } from "./auth";
-import { getChatDisplayTitle, getUserChats, getUserProfile } from "./chat";
+import {
+  getChatDisplayTitle,
+  getUserProfile,
+  markChatAsRead,
+  subscribeToChatReads,
+  subscribeToUserChats,
+} from "./chat";
 import { sendMessage, subscribeToMessages } from "./messages";
+import {
+  getPushState,
+  initOneSignal,
+  loginOneSignal,
+  logoutOneSignal,
+  requestPushPermission,
+} from "./onesignal";
+import { sendPushNotification } from "./notify";
 import "./styles.css";
 
 function formatTime(timestamp) {
@@ -72,6 +86,7 @@ function App() {
   const [isLoggingIn, setIsLoggingIn] = useState(false);
 
   const [chats, setChats] = useState([]);
+  const [chatReads, setChatReads] = useState({});
   const [activeChat, setActiveChat] = useState(null);
 
   const [serverMessages, setServerMessages] = useState([]);
@@ -85,6 +100,16 @@ function App() {
   const [isMobileView, setIsMobileView] = useState(
     window.matchMedia(mobileQuery).matches
   );
+
+  const [pushState, setPushState] = useState({
+    permission: "default",
+    optedIn: false,
+    subscriptionId: null,
+    externalId: null,
+  });
+  const [isPushBusy, setIsPushBusy] = useState(false);
+
+  const [isSidebarMenuOpen, setIsSidebarMenuOpen] = useState(false);
 
   const bottomRef = useRef(null);
   const activeChatIdRef = useRef(null);
@@ -134,57 +159,149 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const unsubscribe = observeAuth(async (u) => {
+    async function bootstrapOneSignal() {
+      try {
+        await initOneSignal();
+        const state = await getPushState();
+        setPushState(state);
+      } catch (error) {
+        console.error("Ошибка инициализации OneSignal:", error);
+      }
+    }
+
+    bootstrapOneSignal();
+  }, []);
+
+  useEffect(() => {
+    let unsubscribeChats = null;
+    let unsubscribeReads = null;
+
+    const unsubscribeAuth = observeAuth(async (u) => {
       setUser(u);
-      setActiveChat(null);
+      setProfile(null);
       setChats([]);
+      setChatReads({});
+      setActiveChat(null);
       setServerMessages([]);
       setPendingMessages([]);
       setText("");
+      setIsSidebarMenuOpen(false);
+
+      if (unsubscribeChats) {
+        unsubscribeChats();
+        unsubscribeChats = null;
+      }
+
+      if (unsubscribeReads) {
+        unsubscribeReads();
+        unsubscribeReads = null;
+      }
 
       if (!u) {
-        setProfile(null);
+        try {
+          await logoutOneSignal();
+          const state = await getPushState();
+          setPushState(state);
+        } catch (error) {
+          console.error("Ошибка logout OneSignal:", error);
+        }
+
         return;
+      }
+
+      try {
+        await loginOneSignal(u.uid);
+        const state = await getPushState();
+        setPushState(state);
+      } catch (error) {
+        console.error("Ошибка login OneSignal:", error);
       }
 
       try {
         const currentUserProfile = await getUserProfile(u.uid);
         setProfile(currentUserProfile);
-
-        setLoadingChats(true);
-
-        const rawChats = await getUserChats(u.uid);
-
-        const preparedChats = await Promise.all(
-          rawChats.map(async (chat) => {
-            const displayTitle = await getChatDisplayTitle(chat, u.uid);
-
-            return {
-              ...chat,
-              displayTitle,
-            };
-          })
-        );
-
-        preparedChats.sort((a, b) => {
-          if (a.type === "group" && b.type !== "group") return 1;
-          if (a.type !== "group" && b.type === "group") return -1;
-          return a.displayTitle.localeCompare(b.displayTitle, "ru");
-        });
-
-        setChats(preparedChats);
-
-        if (!window.matchMedia(mobileQuery).matches && preparedChats.length > 0) {
-          setActiveChat(preparedChats[0]);
-        }
       } catch (error) {
-        console.error("Ошибка загрузки данных:", error);
-      } finally {
-        setLoadingChats(false);
+        console.error("Ошибка загрузки профиля:", error);
       }
+
+      setLoadingChats(true);
+
+      unsubscribeChats = subscribeToUserChats(
+        u.uid,
+        async (rawChats) => {
+          try {
+            const preparedChats = await Promise.all(
+              rawChats.map(async (chat) => {
+                const displayTitle = await getChatDisplayTitle(chat, u.uid);
+
+                return {
+                  ...chat,
+                  displayTitle,
+                };
+              })
+            );
+
+            preparedChats.sort((a, b) => {
+              const aTime = Number(a.lastMessageAt || 0);
+              const bTime = Number(b.lastMessageAt || 0);
+
+              if (bTime !== aTime) {
+                return bTime - aTime;
+              }
+
+              if (a.type === "group" && b.type !== "group") return 1;
+              if (a.type !== "group" && b.type === "group") return -1;
+
+              return a.displayTitle.localeCompare(b.displayTitle, "ru");
+            });
+
+            setChats(preparedChats);
+
+            setActiveChat((prev) => {
+              if (!prev) {
+                if (!window.matchMedia(mobileQuery).matches && preparedChats.length > 0) {
+                  return preparedChats[0];
+                }
+                return prev;
+              }
+
+              const stillExists = preparedChats.find((chat) => chat.id === prev.id);
+              return stillExists || null;
+            });
+          } catch (error) {
+            console.error("Ошибка подготовки чатов:", error);
+          } finally {
+            setLoadingChats(false);
+          }
+        },
+        (error) => {
+          console.error("Ошибка подписки на чаты:", error);
+          setLoadingChats(false);
+        }
+      );
+
+      unsubscribeReads = subscribeToChatReads(
+        u.uid,
+        (readsMap) => {
+          setChatReads(readsMap);
+        },
+        (error) => {
+          console.error("Ошибка подписки на chatReads:", error);
+        }
+      );
     });
 
-    return () => unsubscribe();
+    return () => {
+      unsubscribeAuth();
+
+      if (unsubscribeChats) {
+        unsubscribeChats();
+      }
+
+      if (unsubscribeReads) {
+        unsubscribeReads();
+      }
+    };
   }, []);
 
   useEffect(() => {
@@ -237,6 +354,64 @@ function App() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [visibleMessages, activeChat?.id]);
 
+  useEffect(() => {
+    if (!isMobileView) {
+      return;
+    }
+
+    const handlePopState = () => {
+      setIsSidebarMenuOpen(false);
+
+      if (activeChatIdRef.current) {
+        setActiveChat(null);
+      }
+    };
+
+    window.addEventListener("popstate", handlePopState);
+
+    return () => {
+      window.removeEventListener("popstate", handlePopState);
+    };
+  }, [isMobileView]);
+
+  useEffect(() => {
+    if (!isMobileView || !activeChat) {
+      return;
+    }
+
+    const currentState = window.history.state || {};
+
+    if (!currentState.chatOpen) {
+      window.history.pushState({ chatOpen: true }, "");
+    }
+  }, [activeChat, isMobileView]);
+
+  useEffect(() => {
+    async function syncReadState() {
+      if (!user || !activeChat) return;
+
+      const lastVisibleMessage = visibleMessages[visibleMessages.length - 1];
+      const latestVisibleAt = Number(lastVisibleMessage?.createdAtMs || 0);
+      const latestChatAt = Number(activeChat?.lastMessageAt || 0);
+      const latestAt = Math.max(latestVisibleAt, latestChatAt);
+      const currentReadAt = Number(chatReads[activeChat.id] || 0);
+
+      if (latestAt > currentReadAt) {
+        try {
+          await markChatAsRead(activeChat.id, user.uid, latestAt);
+          setChatReads((prev) => ({
+            ...prev,
+            [activeChat.id]: latestAt,
+          }));
+        } catch (error) {
+          console.error("Ошибка markChatAsRead:", error);
+        }
+      }
+    }
+
+    syncReadState();
+  }, [activeChat?.id, activeChat?.lastMessageAt, visibleMessages, user, chatReads]);
+
   async function handleLogin() {
     try {
       setIsLoggingIn(true);
@@ -254,8 +429,40 @@ function App() {
   async function handleLogout() {
     try {
       await logout();
+      await logoutOneSignal();
+      const state = await getPushState();
+      setPushState(state);
+      setIsSidebarMenuOpen(false);
     } catch (error) {
       console.error("Ошибка выхода:", error);
+    }
+  }
+
+  async function handleEnablePush() {
+    try {
+      setIsPushBusy(true);
+      const state = await requestPushPermission();
+      setPushState(state);
+      alert(
+        `Push status:\npermission=${state.permission}\noptedIn=${state.optedIn}\nexternalId=${state.externalId || "null"}`
+      );
+    } catch (error) {
+      console.error("Ошибка включения push:", error);
+      alert("Не удалось включить уведомления");
+    } finally {
+      setIsPushBusy(false);
+    }
+  }
+
+  async function handleRefreshPushState() {
+    try {
+      const state = await getPushState();
+      setPushState(state);
+      alert(
+        `Push status:\npermission=${state.permission}\noptedIn=${state.optedIn}\nexternalId=${state.externalId || "null"}`
+      );
+    } catch (error) {
+      console.error("Ошибка проверки push:", error);
     }
   }
 
@@ -267,6 +474,7 @@ function App() {
     if (isSending) return;
 
     const clientMessageId = buildTempId();
+    const now = Date.now();
 
     const optimisticMessage = {
       id: clientMessageId,
@@ -275,7 +483,7 @@ function App() {
       senderId: user.uid,
       senderName: currentUserName,
       text: trimmed,
-      createdAtMs: Date.now(),
+      createdAtMs: now,
       pending: true,
       failed: false,
     };
@@ -300,6 +508,36 @@ function App() {
             : msg
         )
       );
+
+      if (activeChat) {
+        setChats((prev) =>
+          prev.map((chat) =>
+            chat.id === activeChat.id
+              ? {
+                  ...chat,
+                  lastMessageAt: now,
+                  lastMessageSenderId: user.uid,
+                  lastMessageText: trimmed,
+                }
+              : chat
+          )
+        );
+      }
+
+      const recipientIds = (activeChat.members || []).filter(
+        (id) => id !== user.uid
+      );
+
+      if (recipientIds.length > 0) {
+        await sendPushNotification({
+          chatId: activeChat.id,
+          chatTitle: activeChat.displayTitle || "Чат",
+          messageText: trimmed,
+          senderId: user.uid,
+          senderName: currentUserName,
+          recipientIds,
+        });
+      }
     } catch (error) {
       console.error("Ошибка отправки сообщения:", error);
 
@@ -325,11 +563,30 @@ function App() {
   }
 
   function openChat(chat) {
+    setIsSidebarMenuOpen(false);
     setActiveChat(chat);
   }
 
   function backToChatList() {
+    if (isMobileView) {
+      if (window.history.state?.chatOpen) {
+        window.history.back();
+        return;
+      }
+
+      setActiveChat(null);
+      return;
+    }
+
     setActiveChat(null);
+  }
+
+  function getChatUnread(chat) {
+    const lastMessageAt = Number(chat.lastMessageAt || 0);
+    const lastReadAt = Number(chatReads[chat.id] || 0);
+    const isOwnLastMessage = chat.lastMessageSenderId === user?.uid;
+
+    return lastMessageAt > lastReadAt && !isOwnLastMessage;
   }
 
   if (!user) {
@@ -356,11 +613,46 @@ function App() {
             <div className="sidebar-header-text">
               <div className="sidebar-title">Чаты</div>
               <div className="sidebar-user">{currentUserName}</div>
+              <div className="sidebar-user">
+                Push: {pushState.optedIn ? "включен" : "выключен"}
+              </div>
             </div>
 
-            <button className="secondary-button" onClick={handleLogout}>
-              Выйти
-            </button>
+            <div className="sidebar-menu-wrap">
+              <button
+                className="icon-button"
+                onClick={() => setIsSidebarMenuOpen((prev) => !prev)}
+                aria-label="Меню"
+              >
+                ⋮
+              </button>
+
+              {isSidebarMenuOpen ? (
+                <div className="sidebar-menu">
+                  <button
+                    className="sidebar-menu-item"
+                    onClick={handleEnablePush}
+                    disabled={isPushBusy}
+                  >
+                    {isPushBusy ? "..." : "Включить push"}
+                  </button>
+
+                  <button
+                    className="sidebar-menu-item"
+                    onClick={handleRefreshPushState}
+                  >
+                    Проверить push
+                  </button>
+
+                  <button
+                    className="sidebar-menu-item sidebar-menu-item-danger"
+                    onClick={handleLogout}
+                  >
+                    Выйти
+                  </button>
+                </div>
+              ) : null}
+            </div>
           </div>
 
           <div className="chat-list">
@@ -369,20 +661,32 @@ function App() {
             ) : chats.length === 0 ? (
               <div className="empty-state">Чаты не найдены</div>
             ) : (
-              chats.map((chat) => (
-                <button
-                  key={chat.id}
-                  className={`chat-item ${
-                    activeChat?.id === chat.id ? "chat-item-active" : ""
-                  }`}
-                  onClick={() => openChat(chat)}
-                >
-                  <div className="chat-item-title">{chat.displayTitle}</div>
-                  <div className="chat-item-subtitle">
-                    {chat.type === "group" ? "Групповой чат" : "Личный чат"}
-                  </div>
-                </button>
-              ))
+              chats.map((chat) => {
+                const hasUnread = getChatUnread(chat);
+
+                return (
+                  <button
+                    key={chat.id}
+                    className={`chat-item ${
+                      activeChat?.id === chat.id ? "chat-item-active" : ""
+                    }`}
+                    onClick={() => openChat(chat)}
+                  >
+                    <div className="chat-item-top">
+                      <div className="chat-item-title">{chat.displayTitle}</div>
+                      {hasUnread ? <span className="unread-dot" /> : null}
+                    </div>
+
+                    <div className="chat-item-subtitle">
+                      {chat.type === "group" ? "Групповой чат" : "Личный чат"}
+                    </div>
+
+                    <div className="chat-item-preview">
+                      {chat.lastMessageText || "Сообщений пока нет"}
+                    </div>
+                  </button>
+                );
+              })
             )}
           </div>
         </aside>

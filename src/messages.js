@@ -1,19 +1,17 @@
 import {
   addDoc,
   collection,
+  doc,
   onSnapshot,
   query,
+  updateDoc,
   where,
 } from "firebase/firestore";
 import { db } from "./firebase";
 
 export function subscribeToMessages(chatId, callback, errorCallback) {
   const messagesRef = collection(db, "messages");
-
-  const q = query(
-    messagesRef,
-    where("chatId", "==", chatId)
-  );
+  const q = query(messagesRef, where("chatId", "==", chatId));
 
   return onSnapshot(
     q,
@@ -53,6 +51,7 @@ export async function sendMessage({
 
   if (!trimmedText) return;
 
+  const now = Date.now();
   const messagesRef = collection(db, "messages");
 
   await addDoc(messagesRef, {
@@ -61,6 +60,14 @@ export async function sendMessage({
     senderName,
     text: trimmedText,
     clientMessageId,
-    localCreatedAt: Date.now(),
+    localCreatedAt: now,
+  });
+
+  const chatRef = doc(db, "chats", chatId);
+
+  await updateDoc(chatRef, {
+    lastMessageAt: now,
+    lastMessageSenderId: senderId,
+    lastMessageText: trimmedText,
   });
 }

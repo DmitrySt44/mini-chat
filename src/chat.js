@@ -2,21 +2,35 @@ import {
   collection,
   doc,
   getDoc,
-  getDocs,
+  onSnapshot,
   query,
+  setDoc,
   where,
 } from "firebase/firestore";
 import { db } from "./firebase";
 
-export async function getUserChats(uid) {
+export function subscribeToUserChats(uid, callback, errorCallback) {
   const chatsRef = collection(db, "chats");
   const q = query(chatsRef, where("members", "array-contains", uid));
-  const snapshot = await getDocs(q);
 
-  return snapshot.docs.map((item) => ({
-    id: item.id,
-    ...item.data(),
-  }));
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      const chats = snapshot.docs.map((item) => ({
+        id: item.id,
+        ...item.data(),
+      }));
+
+      callback(chats);
+    },
+    (error) => {
+      if (errorCallback) {
+        errorCallback(error);
+      } else {
+        console.error("Ошибка подписки на чаты:", error);
+      }
+    }
+  );
 }
 
 export async function getUserProfile(uid) {
@@ -51,4 +65,46 @@ export async function getChatDisplayTitle(chat, currentUserId) {
   }
 
   return otherUser.name || otherUser.email || "Личный чат";
+}
+
+export function subscribeToChatReads(userId, callback, errorCallback) {
+  const readsRef = collection(db, "chatReads");
+  const q = query(readsRef, where("userId", "==", userId));
+
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      const map = {};
+
+      snapshot.docs.forEach((item) => {
+        const data = item.data();
+        map[data.chatId] = Number(data.lastReadAt || 0);
+      });
+
+      callback(map);
+    },
+    (error) => {
+      if (errorCallback) {
+        errorCallback(error);
+      } else {
+        console.error("Ошибка подписки на chatReads:", error);
+      }
+    }
+  );
+}
+
+export async function markChatAsRead(chatId, userId, lastReadAt) {
+  if (!chatId || !userId || !lastReadAt) return;
+
+  const readRef = doc(db, "chatReads", `${chatId}_${userId}`);
+
+  await setDoc(
+    readRef,
+    {
+      chatId,
+      userId,
+      lastReadAt: Number(lastReadAt),
+    },
+    { merge: true }
+  );
 }
